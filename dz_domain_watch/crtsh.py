@@ -1,17 +1,22 @@
 """crt.sh collector for DZ Domain Watch.
 
-Alternative — and far more reliable — data source than the public CertStream
-firehose. Instead of streaming every certificate in the world, it queries the
-official Certificate Transparency search engine crt.sh (operated by Sectigo)
-for a curated set of Algeria-related seed keywords, then scores every returned
-domain with the full local watchlist.
+Queries crt.sh (official Certificate Transparency search by Sectigo) for
+Algeria-related seed keywords and scores every returned domain.
 
-This pulls REAL certificates from the public CT logs and works over plain
-HTTPS, which makes it ideal for restricted networks and GitHub Codespaces.
+Key design decisions:
+- Bare labels (no dot in domain) are skipped — they are not valid hostnames.
+- crt.sh cert IDs are deduplicated within a pass so two seeds that return
+  the same certificate don't produce duplicate terminal output.
+- Scoring is calibrated: a known legitimate company domain like naftal.dz
+  gets scored as MEDIUM (brand match only), not CRITICAL — CRITICAL requires
+  a suspicious word OR a risky TLD in addition to the brand match.
+- Only certificates not expired (not_after >= today) are processed, reducing
+  noise from historical data.
 
-Usage (wired through collector.py):
-    python -m dz_domain_watch.collector --source crtsh
-    python -m dz_domain_watch.collector --source crtsh --min-score 40 --once
+Usage:
+    python -m dz_domain_watch.collector                   # default: crt.sh
+    python -m dz_domain_watch.collector --once            # single pass, exit
+    python -m dz_domain_watch.collector --min-score 40
 """
 
 import json
@@ -26,13 +31,13 @@ from .models import CertEvent
 from .scoring import get_watchlist, score_domain
 from .utils import extract_parts, get_tld, is_wildcard, normalize_domain
 
-_CRTSH_URL = "https://crt.sh/?q={query}&output=json"
+# Only fetch non-expired certs; deduplicate=Y collapses identical certs
+_CRTSH_URL = "https://crt.sh/?q={query}&output=json&exclude=expired&deduplicate=Y"
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 
-# Colour helpers (mirror collector.py)
 _RED, _YLW, _CYN, _GRN, _RST, _BLD = (
     "\033[91m", "\033[93m", "\033[96m", "\033[92m", "\033[0m", "\033[1m"
 )
@@ -66,14 +71,7 @@ def _print_alert(event: CertEvent) -> None:
 
 
 def fetch_crtsh(query: str, timeout: int = 40, retries: int = 4) -> list[dict]:
-    """Query crt.sh for a keyword and return the parsed JSON list.
-
-    Retries on transient server errors (429/502/503/504) with exponential
-    backoff, since the public crt.sh service is frequently overloaded.
-    Returns an empty list on any unrecoverable error so the collector never
-    crashes on a single failed lookup.
-    """
-    # Transient HTTP codes worth retrying (rate limit + gateway/overload errors)
+    """Query crt.sh for a keyword. Retries on transient errors (429/502/503/504)."""
     transient = {429, 500, 502, 503, 504}
     url = _CRTSH_URL.format(query=urllib.parse.quote(query))
     for attempt in range(retries + 1):
@@ -88,7 +86,7 @@ def fetch_crtsh(query: str, timeout: int = 40, retries: int = 4) -> list[dict]:
             return json.loads(raw)
         except urllib.error.HTTPError as exc:
             if exc.code in transient and attempt < retries:
-                wait = min(30, 3 * (2 ** attempt))  # 3,6,12,24,30s
+                wait = min(30, 3 * (2 ** attempt))
                 _log(f"crt.sh {exc.code} sur '{query}' — nouvel essai dans {wait}s…", "warn")
                 time.sleep(wait)
                 continue
@@ -104,26 +102,57 @@ def fetch_crtsh(query: str, timeout: int = 40, retries: int = 4) -> list[dict]:
     return []
 
 
-def _record_to_events(record: dict, min_score: int) -> list[CertEvent]:
-    """Turn one crt.sh JSON record into scored CertEvent objects (one per SAN)."""
+def _record_to_events(
+    record: dict,
+    min_score: int,
+    seen_cert_ids: set,
+) -> list[CertEvent]:
+    """Turn one crt.sh JSON record into scored CertEvent objects.
+
+    Args:
+        record: raw crt.sh JSON record.
+        min_score: discard events below this score.
+        seen_cert_ids: mutable set of already-processed cert IDs this pass;
+                       records already in this set are skipped entirely.
+    """
+    cert_id = record.get("id")
+
+    # Deduplicate within a single pass: multiple seeds may return the same cert
+    if cert_id and cert_id in seen_cert_ids:
+        return []
+    if cert_id:
+        seen_cert_ids.add(cert_id)
+
     events: list[CertEvent] = []
 
-    cert_id = record.get("id")
     issuer = record.get("issuer_name") or "Unknown"
     not_before = record.get("not_before")
     not_after = record.get("not_after")
     entry_ts = record.get("entry_timestamp")
     seen_utc = entry_ts or datetime.now(tz=timezone.utc).isoformat()
 
-    # name_value holds one or more domains separated by newlines (the SANs)
-    raw_names = (record.get("name_value") or record.get("common_name") or "").split("\n")
+    # name_value can be newline-separated SANs; common_name is the fallback
+    raw_names_str = record.get("name_value") or record.get("common_name") or ""
+    raw_names = [n.strip() for n in raw_names_str.split("\n") if n.strip()]
+
+    # Deduplicate SANs within the same certificate (e.g. *.naftal.dz + naftal.dz)
+    seen_domains_in_cert: set[str] = set()
 
     for raw_domain in raw_names:
-        raw_domain = raw_domain.strip()
-        if not raw_domain or " " in raw_domain:
+        if " " in raw_domain:
             continue
 
         domain = normalize_domain(raw_domain)
+
+        # Skip bare labels (no dot = not a valid FQDN e.g. "naftal", "localhost")
+        if "." not in domain:
+            continue
+
+        # Skip pure wildcard base already covered by the FQDN version
+        if domain in seen_domains_in_cert:
+            continue
+        seen_domains_in_cert.add(domain)
+
         wildcard = is_wildcard(raw_domain)
         parts = extract_parts(domain)
         tld = get_tld(domain)
@@ -144,7 +173,7 @@ def _record_to_events(record: dict, min_score: int) -> list[CertEvent]:
                 not_after_utc=not_after,
                 source="crt.sh",
                 cert_link=f"https://crt.sh/?id={cert_id}" if cert_id else None,
-                fingerprint=f"crtsh-{cert_id}" if cert_id else f"crtsh-{domain}-{seen_utc}",
+                fingerprint=f"crtsh-{cert_id}-{domain}" if cert_id else f"crtsh-{domain}-{seen_utc}",
                 is_wildcard=wildcard,
                 risk_score=result.risk_score,
                 risk_level=result.risk_level,
@@ -158,11 +187,13 @@ def _record_to_events(record: dict, min_score: int) -> list[CertEvent]:
 
 
 def run_one_pass(min_score: int, polite_delay: float = 3.0) -> int:
-    """Run a single sweep over all crt.sh seed keywords. Returns new alerts count."""
+    """Sweep all crt.sh seed keywords. Returns count of newly inserted events."""
     wl = get_watchlist()
     seeds = wl.get("crtsh_seeds") or wl.get("country_keywords", [])
     new_alerts = 0
     total_certs = 0
+    # Shared across all seeds: ensures the same cert is never processed twice
+    seen_cert_ids: set = set()
 
     _log(f"Début d'une passe sur {len(seeds)} mots-clés algériens…", "info")
 
@@ -170,15 +201,19 @@ def run_one_pass(min_score: int, polite_delay: float = 3.0) -> int:
         records = fetch_crtsh(seed)
         total_certs += len(records)
         if records:
-            _log(f"[{i:2d}/{len(seeds)}] '{seed}': {len(records)} certificats CT", "info")
+            _log(f"[{i:2d}/{len(seeds)}] '{seed}': {len(records)} certificats CT reçus", "info")
         for record in records:
-            for event in _record_to_events(record, min_score):
+            for event in _record_to_events(record, min_score, seen_cert_ids):
                 if insert_event(event):
                     new_alerts += 1
                     _print_alert(event)
-        time.sleep(polite_delay)  # poli avec le service public crt.sh
+        time.sleep(polite_delay)
 
-    _log(f"Passe terminée — {total_certs} certificats analysés, {new_alerts} nouvelle(s) alerte(s).", "ok")
+    _log(
+        f"Passe terminée — {total_certs} certificats analysés, "
+        f"{new_alerts} nouvelle(s) alerte(s) enregistrée(s).",
+        "ok",
+    )
     return new_alerts
 
 
@@ -187,19 +222,14 @@ def run_crtsh_collector(
     poll_interval: int = 600,
     once: bool = False,
 ) -> None:
-    """Run the crt.sh collector, optionally looping forever.
-
-    Args:
-        min_score: minimum risk score to store an event.
-        poll_interval: seconds to wait between full sweeps (default 10 min).
-        once: if True, run a single sweep and exit (useful for testing/cron).
-    """
+    """Run the crt.sh collector in a loop (or once with once=True)."""
     init_db()
     _log("=" * 60, "ok")
     _log("DZ Domain Watch — Collecteur CT (source: crt.sh)", "ok")
     _log(f"Score minimum : {min_score}", "ok")
     _log(f"Intervalle    : {poll_interval}s entre chaque passe", "ok")
     _log("Source RÉELLE : Certificate Transparency logs via crt.sh", "ok")
+    _log("Certificats expirés exclus — focus sur les certs actifs.", "ok")
     _log("=" * 60, "ok")
 
     sweep = 0

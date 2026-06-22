@@ -97,18 +97,25 @@ def score_domain(
     tld = get_tld(domain)
     parts = extract_parts(domain)
 
-    # --- Country keyword match (+40) ---
+    # --- Country keyword match (+15 base, not +40) ---
+    # "dz" alone in a .dz domain is not suspicious by itself.
     kw_hits = contains_keyword(domain, country_keywords)
     if kw_hits:
-        matched_keywords = kw_hits
-        score += 40
-        reasons.append(f"Mot-clé pays détecté: {', '.join(kw_hits)}")
+        # Only count if "dz" appears somewhere OTHER than just the TLD
+        non_tld_hits = [k for k in kw_hits if not (k == "dz" and tld == ".dz")]
+        if non_tld_hits:
+            matched_keywords = non_tld_hits
+            score += 15
+            reasons.append(f"Mot-clé pays détecté: {', '.join(non_tld_hits)}")
+        elif kw_hits:
+            # "dz" only in TLD — note it but don't inflate score
+            matched_keywords = kw_hits
 
-    # --- Brand match (exact substring, +40) ---
+    # --- Brand match (exact substring, +30) ---
     brand_hits = contains_keyword(domain, brands)
     if brand_hits:
         matched_brands = brand_hits
-        score += 40
+        score += 30
         reasons.append(f"Marque algérienne détectée: {', '.join(brand_hits)}")
 
     # --- Fuzzy brand match (+15 if no exact match already) ---
@@ -119,23 +126,26 @@ def score_domain(
             score += 15
             reasons.append(f"Similarité forte avec marque algérienne: {', '.join(fuzzy_hits)}")
 
-    # --- Suspicious word match (+25) ---
+    # --- Suspicious word match (+35) ---
+    # This is the key escalator: a brand alone is informational, but
+    # brand + suspicious word = genuinely concerning.
     sw_hits = contains_keyword(domain, suspicious_words)
     if sw_hits:
         matched_suspicious_words = sw_hits
-        score += 25
+        score += 35
         reasons.append(f"Mot suspect détecté: {', '.join(sw_hits)}")
 
-    # --- Brand + suspicious word combo (+10 bonus) ---
+    # --- Brand + suspicious word combo (+15 bonus) ---
     if matched_brands and matched_suspicious_words:
-        score += 10
+        score += 15
         reasons.append(
             f"Combinaison marque+mot-suspect: {matched_brands[0]} + {matched_suspicious_words[0]}"
         )
 
-    # --- Suspicious TLD (+10) ---
+    # --- Suspicious TLD (+20) ---
+    # A risky TLD (.xyz, .top, .ru…) is a strong signal on its own.
     if tld in suspicious_tlds:
-        score += 10
+        score += 20
         reasons.append(f"TLD à risque: {tld}")
 
     # --- Wildcard certificate (+10) ---
