@@ -7,3 +7,7 @@ rapidfuzz>=3.6.1
 python-dotenv>=1.0.1
 pytest>=8.1.0
 pytest-cov>=5.0.0
+pydeck>=0.8.0
+folium>=0.16.0
+streamlit-folium>=0.20.0
+requests>=2.31.0

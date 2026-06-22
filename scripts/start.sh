@@ -64,6 +64,10 @@ else
     python scripts/run_demo_data.py
 fi
 
+# ── 3b. Inject geo demo data (always, so War Room works even without crt.sh) ──
+log "Injection des données Geo Intelligence War Room…"
+python scripts/run_geo_demo_data.py || warn "run_geo_demo_data.py a échoué (non bloquant)"
+
 echo ""
 
 # ── 4. Launch Streamlit ────────────────────────────────────────────────────
