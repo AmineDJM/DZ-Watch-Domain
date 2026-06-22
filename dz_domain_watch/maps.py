@@ -35,8 +35,8 @@ _RISK_HEX = {
     "low":      "#22c55e",
 }
 
-_DARK_MAP_STYLE = "mapbox://styles/mapbox/dark-v10"
-_LIGHT_MAP_STYLE = "mapbox://styles/mapbox/light-v10"
+_DARK_MAP_STYLE = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
+_LIGHT_MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
 
 
 def _to_df(points: list[dict]) -> pd.DataFrame:
