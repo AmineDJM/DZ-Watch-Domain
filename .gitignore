@@ -18,8 +18,8 @@ data/dz_watch.db
 .vscode/
 .idea/
 
-# Streamlit
-.streamlit/
+# Streamlit (on garde config.toml versionné, on ignore les secrets)
+.streamlit/secrets.toml
 
 # tldextract cache
 .tldextract-cache/
