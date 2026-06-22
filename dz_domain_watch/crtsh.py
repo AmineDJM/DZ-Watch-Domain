@@ -65,12 +65,16 @@ def _print_alert(event: CertEvent) -> None:
     )
 
 
-def fetch_crtsh(query: str, timeout: int = 30, retries: int = 2) -> list[dict]:
+def fetch_crtsh(query: str, timeout: int = 40, retries: int = 4) -> list[dict]:
     """Query crt.sh for a keyword and return the parsed JSON list.
 
-    Returns an empty list on any error (network, 403, malformed JSON) so the
-    collector never crashes on a single failed lookup.
+    Retries on transient server errors (429/502/503/504) with exponential
+    backoff, since the public crt.sh service is frequently overloaded.
+    Returns an empty list on any unrecoverable error so the collector never
+    crashes on a single failed lookup.
     """
+    # Transient HTTP codes worth retrying (rate limit + gateway/overload errors)
+    transient = {429, 500, 502, 503, 504}
     url = _CRTSH_URL.format(query=urllib.parse.quote(query))
     for attempt in range(retries + 1):
         try:
@@ -83,16 +87,19 @@ def fetch_crtsh(query: str, timeout: int = 30, retries: int = 2) -> list[dict]:
                 return []
             return json.loads(raw)
         except urllib.error.HTTPError as exc:
-            if exc.code == 429 and attempt < retries:
-                time.sleep(5 * (attempt + 1))
+            if exc.code in transient and attempt < retries:
+                wait = min(30, 3 * (2 ** attempt))  # 3,6,12,24,30s
+                _log(f"crt.sh {exc.code} sur '{query}' — nouvel essai dans {wait}s…", "warn")
+                time.sleep(wait)
                 continue
-            _log(f"crt.sh HTTP {exc.code} pour '{query}'", "warn")
+            _log(f"crt.sh HTTP {exc.code} pour '{query}' (abandon)", "warn")
             return []
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             if attempt < retries:
-                time.sleep(3 * (attempt + 1))
+                wait = min(30, 3 * (2 ** attempt))
+                time.sleep(wait)
                 continue
-            _log(f"crt.sh erreur '{query}': {exc}", "warn")
+            _log(f"crt.sh erreur '{query}': {exc} (abandon)", "warn")
             return []
     return []
 
@@ -150,7 +157,7 @@ def _record_to_events(record: dict, min_score: int) -> list[CertEvent]:
     return events
 
 
-def run_one_pass(min_score: int, polite_delay: float = 2.0) -> int:
+def run_one_pass(min_score: int, polite_delay: float = 3.0) -> int:
     """Run a single sweep over all crt.sh seed keywords. Returns new alerts count."""
     wl = get_watchlist()
     seeds = wl.get("crtsh_seeds") or wl.get("country_keywords", [])
