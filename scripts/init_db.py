@@ -8,8 +8,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dz_domain_watch.db import init_db
 from dz_domain_watch.geo_db import init_geo_db
+from dz_domain_watch.live_db import init_live_db
 
 if __name__ == "__main__":
     init_db()
     init_geo_db()
-    print("Base de données initialisée avec succès (alertes CT + tables Geo).")
+    init_live_db()
+    print("Base de données initialisée avec succès (alertes CT + Geo + Live).")

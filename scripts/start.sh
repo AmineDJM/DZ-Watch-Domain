@@ -68,6 +68,14 @@ fi
 log "Injection des données Geo Intelligence War Room…"
 python scripts/run_geo_demo_data.py || warn "run_geo_demo_data.py a échoué (non bloquant)"
 
+# ── 3c. Start the continuous live-checker (online/offline status) ───────────
+log "Démarrage du vérificateur 'Domaines Actifs' en arrière-plan…"
+nohup python -m dz_domain_watch.live_checker --min-score 0 \
+    >> /tmp/dz_live_checker.log 2>&1 &
+LIVE_PID=$!
+echo $LIVE_PID > /tmp/dz_live_checker.pid
+log "Vérificateur live démarré (PID $LIVE_PID) — logs: tail -f /tmp/dz_live_checker.log"
+
 echo ""
 
 # ── 4. Launch Streamlit ────────────────────────────────────────────────────

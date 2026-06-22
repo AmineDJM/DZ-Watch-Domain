@@ -9,7 +9,6 @@ Lancement : streamlit run app.py
 """
 
 import json
-import threading
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -25,6 +24,12 @@ from dz_domain_watch.geo_db import (
     fetch_geo_stats,
     init_geo_db,
 )
+from dz_domain_watch.live_db import (
+    fetch_live_stats,
+    fetch_live_status_map,
+    init_live_db,
+)
+from dz_domain_watch import live_checker
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -41,6 +46,14 @@ st_autorefresh(interval=5_000, key="auto_refresh")
 try:
     init_db()
     init_geo_db()
+    init_live_db()
+except Exception:
+    pass
+
+# Start the continuous background live-checker exactly once per process.
+# It writes domain reachability into the live_status table; the UI just reads it.
+try:
+    live_checker.ensure_started(min_score=0)
 except Exception:
     pass
 
@@ -331,162 +344,167 @@ with tab_alerts:
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_live:
     st.markdown(
-        "## 🟢 Domaines Actifs — Vérification en ligne\n"
-        "Teste chaque domaine détecté avec une requête HTTP HEAD pour savoir "
-        "s'il est **réellement en ligne** au moment de la vérification."
+        "## 🟢 Domaines Actifs — Vérification temps réel\n"
+        "Un vérificateur tourne **en continu en arrière-plan** et teste chaque domaine "
+        "détecté (requête HTTP HEAD). Ce tableau se met à jour tout seul — "
+        "**aucun bouton à cliquer**."
     )
 
-    events_for_live = fetch_events(min_score=0, limit=500)
+    live_stats = fetch_live_stats()
+    live_map = fetch_live_status_map()
+    events_for_live = fetch_events(min_score=0, limit=2000)
 
-    if not events_for_live:
-        st.info("Aucune alerte dans la base. Lance d'abord le collecteur ou les données démo.")
-    else:
-        col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([2, 2, 3])
-        with col_ctrl1:
-            live_min_score = st.slider("Score minimum (live)", 0, 100, 40, step=5, key="live_score")
-        with col_ctrl2:
-            live_max_domains = st.number_input("Nb max de domaines à tester", 5, 200, 50, step=5)
-        with col_ctrl3:
-            st.markdown("")
-            st.markdown("")
-            run_check = st.button("🔍 Lancer la vérification live", type="primary")
+    # Dedup events by domain (keep first = highest score / most recent)
+    seen_dom: set = set()
+    unique_events = []
+    for e in events_for_live:
+        d = e.get("domain")
+        if d and d not in seen_dom:
+            seen_dom.add(d)
+            unique_events.append(e)
 
-        # Filter candidates
-        candidates = [
-            e for e in events_for_live
-            if e.get("risk_score", 0) >= live_min_score
-        ][:int(live_max_domains)]
+    total_domains = len(unique_events)
+    total_checked = live_stats.get("total_checked") or 0
+    total_live = live_stats.get("total_live") or 0
+    last_check = live_stats.get("last_check") or "—"
+    if last_check and last_check != "—":
+        try:
+            last_check = datetime.fromisoformat(last_check).strftime("%H:%M:%S")
+        except Exception:
+            pass
 
+    # Status banner
+    if total_checked < total_domains:
         st.info(
-            f"**{len(candidates)}** domaine(s) sélectionné(s) pour vérification "
-            f"(score ≥ {live_min_score}).  \n"
-            "⏱️ La vérification prend ~5-15 secondes selon le nombre de domaines."
+            f"⏳ Vérification en cours en arrière-plan… "
+            f"**{total_checked}/{total_domains}** domaines déjà testés. "
+            f"La page se rafraîchit toute seule toutes les 5s."
+        )
+    else:
+        st.success(
+            f"✅ Tous les domaines ont été vérifiés au moins une fois "
+            f"(re-vérification automatique toutes les 5 min)."
         )
 
-        if run_check and candidates:
-            from dz_domain_watch.live_check import bulk_check
+    # KPIs
+    lk1, lk2, lk3, lk4, lk5 = st.columns(5)
+    with lk1:
+        st.metric("📋 Domaines connus", total_domains)
+    with lk2:
+        st.metric("🔍 Déjà testés", total_checked)
+    with lk3:
+        st.metric("🟢 En ligne", total_live)
+    with lk4:
+        offline = total_checked - total_live
+        st.metric("🔴 Hors ligne", offline)
+    with lk5:
+        st.metric("🕐 Dernier test", last_check)
 
-            domains_to_check = [e["domain"] for e in candidates]
+    st.divider()
 
-            progress_bar = st.progress(0, text="Vérification en cours…")
-            status_text = st.empty()
+    # Filter controls (these just filter the displayed table, no heavy work)
+    fc1, fc2 = st.columns([2, 3])
+    with fc1:
+        live_min_score = st.slider("Score minimum affiché", 0, 100, 0, step=5, key="live_score")
+    with fc2:
+        show_filter = st.radio(
+            "Afficher",
+            ["🟢 En ligne uniquement", "Tous (en ligne + hors ligne)", "🔴 Hors ligne uniquement"],
+            horizontal=True,
+        )
 
-            # Run check with progress
-            results_container: dict = {}
-            check_done = threading.Event()
+    # Build rows from events + live status
+    live_rows = []
+    dead_rows = []
+    pending_rows = []
+    for event in unique_events:
+        if event.get("risk_score", 0) < live_min_score:
+            continue
+        dom = event["domain"]
+        chk = live_map.get(dom)
 
-            def _run():
-                results_container.update(bulk_check(domains_to_check, max_workers=15))
-                check_done.set()
+        if chk is None:
+            status_label = "⏳ EN ATTENTE"
+        elif chk.get("is_live"):
+            status_label = "🟢 EN LIGNE"
+        else:
+            status_label = "🔴 HORS LIGNE"
 
-            t = threading.Thread(target=_run, daemon=True)
-            t.start()
+        checked_at = (chk.get("checked_at") if chk else "") or ""
+        row = {
+            "Statut": status_label,
+            "HTTP": (chk.get("status_code") if chk else None) or "—",
+            "Score": event.get("risk_score", 0),
+            "Niveau": f"{_LEVEL_EMOJI.get(event.get('risk_level','low'),'')} {event.get('risk_level','')}",
+            "Domaine": dom,
+            "Domaine racine": event.get("registered_domain", ""),
+            "TLD": event.get("tld", ""),
+            "Wildcard": "✅" if event.get("is_wildcard") else "",
+            "Émetteur cert": event.get("issuer", ""),
+            "Valide depuis": (event.get("not_before_utc") or "")[:10],
+            "Expire le": (event.get("not_after_utc") or "")[:10],
+            "Serveur web": (chk.get("server") if chk else "") or "",
+            "Redirection": ((chk.get("redirect_url") if chk else "") or "")[:60],
+            "Marques": _parse_json_col(event.get("matched_brands", "[]")),
+            "Mots suspects": _parse_json_col(event.get("matched_suspicious_words", "[]")),
+            "Raisons": _parse_json_col(event.get("reasons", "[]")),
+            "Source CT": event.get("source", ""),
+            "Lien cert": event.get("cert_link") or "",
+            "Vu à (UTC)": (event.get("seen_utc") or "")[:19].replace("T", " "),
+            "Vérifié à": checked_at[:19].replace("T", " "),
+        }
+        if chk is None:
+            pending_rows.append(row)
+        elif chk.get("is_live"):
+            live_rows.append(row)
+        else:
+            dead_rows.append(row)
 
-            checked = 0
-            while not check_done.is_set():
-                n = len(results_container)
-                if n > checked:
-                    checked = n
-                    pct = min(checked / len(domains_to_check), 1.0)
-                    progress_bar.progress(pct, text=f"Vérifié {checked}/{len(domains_to_check)}…")
-                import time
-                time.sleep(0.3)
+    # Sort live rows by score desc
+    live_rows.sort(key=lambda r: r["Score"], reverse=True)
+    dead_rows.sort(key=lambda r: r["Score"], reverse=True)
 
-            t.join()
-            progress_bar.progress(1.0, text="✅ Vérification terminée !")
-            status_text.empty()
+    _table_cfg = {
+        "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
+        "Lien cert": st.column_config.LinkColumn("Lien cert"),
+    }
 
-            # Merge results with event data
-            live_rows = []
-            dead_rows = []
-            for event in candidates:
-                dom = event["domain"]
-                chk = results_container.get(dom, {})
-                is_live = chk.get("is_live", False)
-                status_code = chk.get("status_code")
-                server = chk.get("server") or ""
-                redirect = chk.get("redirect_url") or ""
-                err = chk.get("error") or ""
-                checked_at = chk.get("checked_at", "")[:19].replace("T", " ")
+    # Decide what to show
+    if show_filter == "🟢 En ligne uniquement":
+        rows_to_show = live_rows
+        title = f"🟢 {len(live_rows)} domaine(s) ACTIFS et JOIGNABLES en ce moment"
+    elif show_filter == "🔴 Hors ligne uniquement":
+        rows_to_show = dead_rows
+        title = f"🔴 {len(dead_rows)} domaine(s) hors ligne / inaccessibles"
+    else:
+        rows_to_show = live_rows + dead_rows + pending_rows
+        title = f"📋 {len(rows_to_show)} domaine(s) (tous statuts)"
 
-                row = {
-                    "🔗 Statut": "🟢 EN LIGNE" if is_live else "🔴 HORS LIGNE",
-                    "HTTP": status_code or "—",
-                    "Score": event.get("risk_score", 0),
-                    "Niveau": f"{_LEVEL_EMOJI.get(event.get('risk_level','low'),'')} {event.get('risk_level','')}",
-                    "Domaine": dom,
-                    "Domaine racine": event.get("registered_domain", ""),
-                    "TLD": event.get("tld", ""),
-                    "Wildcard": "✅" if event.get("is_wildcard") else "",
-                    "Émetteur cert": event.get("issuer", ""),
-                    "Valide depuis": (event.get("not_before_utc") or "")[:10],
-                    "Expire le": (event.get("not_after_utc") or "")[:10],
-                    "Serveur web": server,
-                    "Redirection": redirect[:60] if redirect else "",
-                    "Marques": _parse_json_col(event.get("matched_brands", "[]")),
-                    "Mots suspects": _parse_json_col(event.get("matched_suspicious_words", "[]")),
-                    "Raisons": _parse_json_col(event.get("reasons", "[]")),
-                    "Source CT": event.get("source", ""),
-                    "Lien cert": event.get("cert_link") or "",
-                    "Vu à (UTC)": (event.get("seen_utc") or "")[:19].replace("T", " "),
-                    "Vérifié à": checked_at,
-                    "Erreur": err[:80] if err else "",
-                }
-                if is_live:
-                    live_rows.append(row)
-                else:
-                    dead_rows.append(row)
+    st.subheader(title)
+    if rows_to_show:
+        df_show = pd.DataFrame(rows_to_show)
+        st.dataframe(df_show, use_container_width=True, height=480, column_config=_table_cfg)
 
-            # Summary
-            s1, s2, s3 = st.columns(3)
-            with s1:
-                st.metric("🟢 En ligne", len(live_rows))
-            with s2:
-                st.metric("🔴 Hors ligne / inaccessible", len(dead_rows))
-            with s3:
-                pct_live = round(len(live_rows) / len(candidates) * 100) if candidates else 0
-                st.metric("📊 Taux de réponse", f"{pct_live}%")
+        csv = df_show.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Exporter ce tableau (CSV)",
+            csv,
+            file_name=f"dz_watch_live_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+        )
+    else:
+        if total_checked == 0:
+            st.info("⏳ Le vérificateur démarre… patiente quelques secondes, le tableau se remplit tout seul.")
+        else:
+            st.warning("Aucun domaine ne correspond à ce filtre pour le moment.")
 
-            if live_rows:
-                st.subheader(f"🟢 {len(live_rows)} domaine(s) ACTIFS et JOIGNABLES")
-                st.markdown(
-                    "⚠️ Ces domaines répondent à une requête HTTP — "
-                    "ils sont **réellement opérationnels** au moment du test."
-                )
-                df_live = pd.DataFrame(live_rows)
-                st.dataframe(
-                    df_live,
-                    use_container_width=True,
-                    height=450,
-                    column_config={
-                        "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
-                        "Lien cert": st.column_config.LinkColumn("Lien cert"),
-                    },
-                )
-
-                # Export
-                csv = df_live.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "⬇️ Exporter les domaines actifs (CSV)",
-                    csv,
-                    file_name=f"dz_watch_live_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.success("Aucun domaine actif détecté parmi les candidats testés.")
-
-            if dead_rows:
-                with st.expander(f"🔴 {len(dead_rows)} domaine(s) hors ligne / inaccessibles"):
-                    st.dataframe(pd.DataFrame(dead_rows), use_container_width=True, height=300)
-
-        elif not run_check:
-            st.markdown(
-                "👆 Clique sur **Lancer la vérification live** pour tester les domaines."
-            )
+    if pending_rows and show_filter != "Tous (en ligne + hors ligne)":
+        st.caption(f"⏳ {len(pending_rows)} domaine(s) encore en attente de vérification.")
 
     st.divider()
     st.caption(
-        "Vérification passive via requête HTTP HEAD — aucun scan, aucune interaction avec le contenu des sites."
+        "Vérification passive via requête HTTP HEAD — aucun scan de port, aucune interaction "
+        "avec le contenu des sites. Re-test automatique toutes les 5 minutes."
     )
 
 
