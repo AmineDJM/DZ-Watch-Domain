@@ -15,8 +15,6 @@ import sys
 import time
 from datetime import datetime, timezone
 
-import certstream
-
 from .db import init_db, insert_event
 from .models import CertEvent
 from .scoring import score_domain
@@ -165,6 +163,16 @@ def run_collector(min_score: int = MIN_SCORE_DEFAULT, debug: bool = False) -> No
     _min_score = min_score
     _debug_mode = debug
 
+    try:
+        import certstream  # noqa: F401
+    except ImportError:
+        _log(
+            "Le module 'certstream' n'est pas installé. "
+            "Utilisez plutôt la source fiable: --source crtsh",
+            "error",
+        )
+        sys.exit(1)
+
     init_db()
     _log(f"DZ Domain Watch — Collector démarré (score minimum: {min_score})", "ok")
     _log("En attente de certificats CertStream… (Ctrl+C pour arrêter)", "info")
@@ -214,10 +222,36 @@ def main() -> None:
         action="store_true",
         help="Injecter des données fictives pour tester l'interface",
     )
+    parser.add_argument(
+        "--source",
+        choices=["certstream", "crtsh"],
+        default="crtsh",
+        help="Source de données: 'crtsh' (fiable, recommandé) ou 'certstream' "
+        "(flux live, mais serveur public souvent indisponible). Défaut: crtsh",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="(source crtsh) Faire une seule passe puis s'arrêter",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=int,
+        default=600,
+        help="(source crtsh) Secondes entre chaque vérification (défaut: 600)",
+    )
     args = parser.parse_args()
 
     if args.demo:
         run_demo(min_score=args.min_score)
+    elif args.source == "crtsh":
+        from .crtsh import run_crtsh_collector
+
+        run_crtsh_collector(
+            min_score=args.min_score,
+            poll_interval=args.poll_interval,
+            once=args.once,
+        )
     else:
         run_collector(min_score=args.min_score, debug=args.debug)
 

@@ -90,13 +90,26 @@ python scripts/init_db.py
 
 ---
 
+## Sources de données
+
+L'outil sait collecter de **vrais** certificats Certificate Transparency depuis deux sources :
+
+| Source | Option | Fiabilité | Détail |
+|--------|--------|-----------|--------|
+| **crt.sh** (par défaut) | `--source crtsh` | ✅ Élevée | Interroge le moteur officiel de recherche CT (Sectigo) sur des mots-clés algériens. Données réelles immédiates, fonctionne en HTTPS (idéal Codespaces / réseaux restreints). |
+| **CertStream** | `--source certstream` | ⚠️ Variable | Flux WebSocket temps réel. Le serveur public Calidog (`certstream.calidog.io`) est **souvent indisponible** ; à n'utiliser que s'il répond. |
+
+> **Important** : le serveur public CertStream est historiquement instable. Si le collecteur CertStream se connecte mais n'affiche jamais de certificat, ce n'est pas un bug du code : c'est la source publique qui ne diffuse rien. Utilisez `--source crtsh` (le défaut).
+
+---
+
 ## Lancement
 
-### Mode normal (CertStream live)
+### Mode normal (source crt.sh — recommandé)
 
 Ouvrir **deux terminaux** :
 
-**Terminal 1 — Collector :**
+**Terminal 1 — Collector (vraies données CT via crt.sh) :**
 ```bash
 source .venv/bin/activate
 python -m dz_domain_watch.collector
@@ -113,11 +126,20 @@ Puis ouvrir : [http://localhost:8501](http://localhost:8501)
 ### Options du collector
 
 ```bash
+# Source crt.sh (défaut) — vraies données CT, fiable
+python -m dz_domain_watch.collector
+
+# Une seule passe crt.sh puis arrêt (test rapide)
+python -m dz_domain_watch.collector --once
+
+# Intervalle entre vérifications crt.sh (défaut: 600s)
+python -m dz_domain_watch.collector --poll-interval 300
+
 # Score minimum personnalisé (défaut: 30)
 python -m dz_domain_watch.collector --min-score 40
 
-# Mode debug (affiche les domaines filtrés)
-python -m dz_domain_watch.collector --debug
+# Flux CertStream live (si le serveur public répond)
+python -m dz_domain_watch.collector --source certstream --debug
 
 # Mode démo (injecte des données fictives)
 python -m dz_domain_watch.collector --demo
