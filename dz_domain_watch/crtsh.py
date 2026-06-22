@@ -150,23 +150,28 @@ def _record_to_events(record: dict, min_score: int) -> list[CertEvent]:
     return events
 
 
-def run_one_pass(min_score: int, polite_delay: float = 1.5) -> int:
+def run_one_pass(min_score: int, polite_delay: float = 2.0) -> int:
     """Run a single sweep over all crt.sh seed keywords. Returns new alerts count."""
     wl = get_watchlist()
     seeds = wl.get("crtsh_seeds") or wl.get("country_keywords", [])
     new_alerts = 0
+    total_certs = 0
 
-    for seed in seeds:
+    _log(f"Début d'une passe sur {len(seeds)} mots-clés algériens…", "info")
+
+    for i, seed in enumerate(seeds, 1):
         records = fetch_crtsh(seed)
+        total_certs += len(records)
         if records:
-            _log(f"'{seed}': {len(records)} certificats reçus de crt.sh", "info")
+            _log(f"[{i:2d}/{len(seeds)}] '{seed}': {len(records)} certificats CT", "info")
         for record in records:
             for event in _record_to_events(record, min_score):
                 if insert_event(event):
                     new_alerts += 1
                     _print_alert(event)
-        time.sleep(polite_delay)  # be gentle with the public crt.sh service
+        time.sleep(polite_delay)  # poli avec le service public crt.sh
 
+    _log(f"Passe terminée — {total_certs} certificats analysés, {new_alerts} nouvelle(s) alerte(s).", "ok")
     return new_alerts
 
 
@@ -183,23 +188,30 @@ def run_crtsh_collector(
         once: if True, run a single sweep and exit (useful for testing/cron).
     """
     init_db()
-    _log(f"DZ Domain Watch — Collecteur crt.sh démarré (score min: {min_score})", "ok")
-    _log(f"Source RÉELLE: logs Certificate Transparency via crt.sh", "ok")
+    _log("=" * 60, "ok")
+    _log("DZ Domain Watch — Collecteur CT (source: crt.sh)", "ok")
+    _log(f"Score minimum : {min_score}", "ok")
+    _log(f"Intervalle    : {poll_interval}s entre chaque passe", "ok")
+    _log("Source RÉELLE : Certificate Transparency logs via crt.sh", "ok")
+    _log("=" * 60, "ok")
 
+    sweep = 0
     while True:
+        sweep += 1
+        _log(f"═══ Passe #{sweep} ═══", "info")
         try:
-            count = run_one_pass(min_score)
-            _log(f"Sweep terminé — {count} nouvelle(s) alerte(s) enregistrée(s).", "ok")
+            run_one_pass(min_score)
         except KeyboardInterrupt:
             _log("Arrêt du collecteur crt.sh.", "warn")
             return
         except Exception as exc:
-            _log(f"Erreur durant le sweep: {exc}", "error")
+            _log(f"Erreur durant la passe #{sweep}: {exc}", "error")
 
         if once:
+            _log("Mode --once : arrêt après une passe.", "warn")
             return
 
-        _log(f"Prochaine vérification dans {poll_interval}s…", "info")
+        _log(f"Prochaine passe dans {poll_interval}s — Ctrl+C pour arrêter.", "info")
         try:
             time.sleep(poll_interval)
         except KeyboardInterrupt:
